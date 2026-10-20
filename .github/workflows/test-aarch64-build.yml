@@ -69,7 +69,7 @@ jobs:
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
-        with</longcat_arg_key>
-<longcat_arg_value>{          name: jcode-linux-aarch64
+        with:
+          name: jcode-linux-aarch64
           path: dist/jcode-linux-aarch64.tar.gz
           retention-days: 7
