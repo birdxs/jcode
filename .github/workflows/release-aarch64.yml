@@ -40,6 +40,8 @@ jobs:
           PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
           OPENSSL_LIB_DIR: /usr/lib/aarch64-linux-gnu
           OPENSSL_INCLUDE_DIR: /usr/include/openssl
+          JCODE_RELEASE_BUILD: "1"
+          JCODE_BUILD_SEMVER: ${{ github.ref_name }}
         run: cargo build --release --target aarch64-unknown-linux-gnu
 
       - name: Upload release
