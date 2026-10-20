@@ -1,7 +1,12 @@
-name: Build aarch64 with glibc compat
+name: Release
 
 on:
-  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -37,8 +42,11 @@ jobs:
           OPENSSL_INCLUDE_DIR: /usr/include/openssl
         run: cargo build --release --target aarch64-unknown-linux-gnu
 
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: jcode-aarch64-compat
-          path: target/aarch64-unknown-linux-gnu/release/jcode
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --pattern "SHA256SUMS" 2>/dev/null || true
+          cp target/aarch64-unknown-linux-gnu/release/jcode ./jcode-linux-aarch64
+          sha256sum jcode-linux-aarch64 >> SHA256SUMS
+          gh release upload "${GITHUB_REF_NAME}" jcode-linux-aarch64 SHA256SUMS --repo "${GITHUB_REPOSITORY}" --clobber
