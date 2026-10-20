@@ -13,7 +13,15 @@ jobs:
       - name: Install cross-compiler and OpenSSL
         run: |
           dpkg --add-architecture arm64
-          apt-get update 2>&1 | grep -v "404\|Not Found" || true
+          cat > /etc/apt/sources.list << 'EOF'
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy main universe
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-updates main universe
+          deb [arch=amd64] http://security.ubuntu.com/ubuntu jammy-security main universe
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main universe
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-updates main universe
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main universe
+          EOF
+          apt-get update -qq
           apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64 pkg-config
 
       - name: Install Rust
