@@ -5,28 +5,30 @@ on:
 
 jobs:
   build:
-    # AlmaLinux 8 has glibc 2.28, compatible with openEuler 24.03's glibc 2.38
-    container: almalinux:8
+    container: ubuntu:22.04
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install cross-compiler and OpenSSL
+        run: |
+          dpkg --add-architecture arm64
+          apt-get update -qq
+          apt-get install -y -qq gcc-aarch64-linux-gnu libssl-dev:arm64 pkg-config
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-gnu
 
-      - name: Install aarch64 cross-compiler
-        run: |
-          dnf install -y gcc-aarch64-linux-gnu
-
-      - name: Build
+      - name: Build release
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
         run: cargo build --release --target aarch64-unknown-linux-gnu
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: jcode-linux-aarch64-compat
+          name: jcode-aarch64-compat
           path: target/aarch64-unknown-linux-gnu/release/jcode
