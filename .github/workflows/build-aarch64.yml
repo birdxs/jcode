@@ -22,7 +22,7 @@ jobs:
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main universe
           EOF
           apt-get update -qq
-          apt-get install -y -qq curl ca-certificates gcc-aarch64-linux-gnu libssl-dev:arm64 pkg-config
+          apt-get install -y -qq curl ca-certificates gcc g++ gcc-aarch64-linux-gnu libssl-dev:arm64 pkg-config
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
