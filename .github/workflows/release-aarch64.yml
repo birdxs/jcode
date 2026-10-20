@@ -1,4 +1,4 @@
-name: Release
+name: Build aarch64 with glibc compat
 
 on:
   push:
