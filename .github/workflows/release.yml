@@ -386,6 +386,7 @@ jobs:
           python3 "$RUNNER_TEMP/recovery.py" "$RELEASE_TAG" "$RELEASE_REPAIR" "$WORKFLOW_SHA"
 
       - name: Install cross-compilation prerequisites
+        shell: bash
         run: |
           set -euo pipefail
           dpkg --add-architecture arm64
