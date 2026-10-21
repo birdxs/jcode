@@ -370,13 +370,10 @@ jobs:
     continue-on-error: true
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.create-release.outputs.tag_sha }}
-          fetch-depth: 0
-
-      # Install tooling before the recovery step: it shells out to git and
-      # python3, neither of which ships in the base ubuntu:22.04 image.
+      # Install git before checkout: when git is missing from the base image,
+      # actions/checkout falls back to downloading a REST API tarball that has
+      # no .git, leaving build.rs unable to embed the git hash/date/changelog.
+      # This step also installs python3, which the recovery step needs.
       - name: Install cross-compilation prerequisites
         shell: bash
         run: |
@@ -393,12 +390,21 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq curl ca-certificates git python3 gcc g++ gcc-aarch64-linux-gnu libssl-dev:arm64 pkg-config
           # ubuntu:22.04 ships git 2.34, which does not support the `*` wildcard
-          # for safe.directory (that landed in 2.36). Name the checkout exactly
-          # so build.rs can embed the git hash/date/changelog instead of
-          # falling back to "(unknown)".
+          # for safe.directory (that landed in 2.36). Name the checkout exactly.
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git config --global --add safe.directory "$(pwd)"
           git --version
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-release.outputs.tag_sha }}
+          fetch-depth: 0
+
+      - name: Verify git checkout has history
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d .git || { echo "::error::.git missing after checkout; build metadata would be '(unknown)'"; exit 1; }
+          echo "git HEAD: $(git rev-parse --short HEAD)"
 
       - name: Apply reviewed release source recovery
         shell: bash
