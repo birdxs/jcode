@@ -4,6 +4,7 @@ use gmail_drafts::*;
 #[path = "ui_todo_stages.rs"]
 mod todo_stages;
 pub(crate) use todo_stages::TodoCardAgent;
+pub(crate) use todo_stages::animate_lane_spinners;
 use todo_stages::{agent_roster_spans, push_stage_lines, push_stage_pips, render_todo_item_line};
 
 use super::*;
@@ -70,8 +71,10 @@ fn render_single_line_system_notice(
     // Ordinary notices are always compact, not just plain one-line strings.
     // Keep deliberately requested reports, command output and login prompts
     // readable. Markdown or a newline alone is not a reason to expand a notice.
-    if matches!(msg.title.as_deref(), Some("Skills" | "Context" | "Support"))
-        || msg.content.starts_with("Shell command · ")
+    if matches!(
+        msg.title.as_deref(),
+        Some("Skills" | "Context" | "Support" | "Cloud transfer")
+    ) || msg.content.starts_with("Shell command · ")
         || msg.content.starts_with("Authentication Status:")
         || (msg.content.contains('\n') && msg.content.contains("/cancel"))
     {
@@ -1399,9 +1402,10 @@ fn render_todos_message_with_cap(
             for (group, items) in &groups {
                 let label = group.as_deref().unwrap_or("other");
                 let goal = todo_card_goal_for_group(&goals, group.as_deref());
-                lines.push(render_todo_goal_header(
+                lines.push(todo_stages::render_group_header(
                     label,
                     items,
+                    &agents,
                     base_indent,
                     inner_width,
                 ));
@@ -1603,26 +1607,6 @@ fn push_todo_status_pips<'a>(
     }
 }
 
-fn render_todo_goal_header(
-    label: &str,
-    todos: &[&crate::todo::TodoItem],
-    base_indent: &str,
-    inner_width: usize,
-) -> Line<'static> {
-    let label_width = label.width();
-    let mut spans = vec![Span::styled(
-        label.to_string(),
-        Style::default().fg(todo_group_color()).bold(),
-    )];
-    spans.push(Span::raw("  "));
-    push_stage_pips(
-        &mut spans,
-        todos,
-        inner_width.saturating_sub(label_width + 2),
-    );
-    todo_card_line(spans, base_indent, inner_width)
-}
-
 /// Overall card header: progress pips (numbered per stage) plus the roster
 /// of swarm agent emoji working on this list.
 fn render_todo_stage_status_header(
@@ -1633,8 +1617,14 @@ fn render_todo_stage_status_header(
 ) -> Line<'static> {
     let mut spans = Vec::new();
     let roster = agent_roster_spans(todos, agents);
-    let roster_width: usize = roster.iter().map(|span| span.content.width()).sum();
-    push_stage_pips(&mut spans, todos, inner_width.saturating_sub(roster_width));
+    let blocked = todo_stages::blocked_phase_spans(todos, agents);
+    let side: usize = roster
+        .iter()
+        .chain(blocked.iter())
+        .map(|span| span.content.width())
+        .sum();
+    push_stage_pips(&mut spans, todos, inner_width.saturating_sub(side));
+    spans.extend(blocked);
     spans.extend(roster);
     todo_card_line(spans, base_indent, inner_width)
 }

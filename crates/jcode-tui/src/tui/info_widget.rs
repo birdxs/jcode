@@ -6,6 +6,7 @@
 //! In left-aligned mode, widgets only appear on the right margin.
 
 pub use super::cloud_git::{DualGitInfo, RepoState};
+pub use super::cloud_status::{CloudMachineStats, CloudProbeState, CloudStatusInfo};
 use super::color_support::rgb;
 #[path = "info_widget_commits.rs"]
 mod commits;
@@ -29,11 +30,9 @@ pub(crate) mod swarm_gallery;
 mod text;
 #[path = "info_widget_tips.rs"]
 mod tips;
-#[path = "info_widget_todos.rs"]
-mod todos_render;
 #[path = "info_widget_usage.rs"]
 mod usage_render;
-use super::info_widget_overview::{InfoPageKind, MAX_TODO_LINES, compute_page_layout};
+use super::info_widget_overview::{InfoPageKind, compute_page_layout};
 use super::workspace_map::VisibleWorkspaceRow;
 use crate::ambient::AmbientStatus;
 pub use crate::memory_types::{
@@ -42,7 +41,6 @@ pub use crate::memory_types::{
 };
 use crate::prompt::ContextInfo;
 use crate::protocol::SwarmMemberStatus;
-use crate::todo::TodoItem;
 use memory_render::{render_memory_compact, render_memory_expanded, render_memory_widget};
 use ratatui::{
     prelude::*,
@@ -69,8 +67,6 @@ use swarm_background::{render_background_compact, render_background_widget, rend
 use text::{truncate_smart, truncate_with_ellipsis};
 pub(crate) use tips::occasional_status_tip;
 use tips::render_tips_widget;
-pub(crate) use todos_render::swarm_plan_todos;
-use todos_render::{render_todos_compact, render_todos_expanded, render_todos_widget};
 pub(crate) use usage_render::render_labeled_bar as render_usage_limit_bar;
 use usage_render::{render_usage_compact, render_usage_widget};
 
@@ -94,8 +90,6 @@ pub enum WidgetKind {
     Overview,
     /// Niri-style workspace map preview
     WorkspaceMap,
-    /// Todo list with progress
-    Todos,
     /// Memory sidecar activity
     MemoryActivity,
     /// Subagents/sessions status
@@ -119,6 +113,8 @@ pub enum WidgetKind {
     Tips,
     /// Changes: the dirty file list (the status line owns branch and counts)
     GitStatus,
+    /// Native SSH cloud machine and workspace details.
+    CloudVm,
     /// Commits: recent history on the current branch
     Commits,
 }
@@ -130,7 +126,6 @@ impl WidgetKind {
             WidgetKind::Diagrams => 0, // Highest priority - user explicitly wants to see it
             WidgetKind::WorkspaceMap => 1,
             WidgetKind::Overview => 2,
-            WidgetKind::Todos => 3,
             WidgetKind::UsageLimits => 5, // Bumped up - important when near limits
             WidgetKind::KvCache => 6,
             WidgetKind::MemoryActivity => 7,
@@ -138,6 +133,7 @@ impl WidgetKind {
             WidgetKind::Compaction => 9,
             WidgetKind::BackgroundTasks => 10,
             WidgetKind::GitStatus => 11,
+            WidgetKind::CloudVm => 12,
             WidgetKind::Commits => 12,
             WidgetKind::SwarmStatus => 12, // Session list - lower priority
             WidgetKind::AmbientMode => 13, // Scheduled agent - lower priority
@@ -151,7 +147,6 @@ impl WidgetKind {
             WidgetKind::Diagrams => Side::Right, // Diagrams on right
             WidgetKind::WorkspaceMap => Side::Right,
             WidgetKind::Overview => Side::Right,
-            WidgetKind::Todos => Side::Right,
             WidgetKind::MemoryActivity => Side::Right,
             WidgetKind::SwarmStatus => Side::Left,
             WidgetKind::Compaction => Side::Left,
@@ -162,6 +157,7 @@ impl WidgetKind {
             WidgetKind::ModelInfo => Side::Left,
             WidgetKind::Tips => Side::Left,
             WidgetKind::GitStatus => Side::Left,
+            WidgetKind::CloudVm => Side::Left,
             WidgetKind::Commits => Side::Left,
         }
     }
@@ -172,7 +168,6 @@ impl WidgetKind {
             WidgetKind::Diagrams => 10, // Diagrams need more space
             WidgetKind::WorkspaceMap => 1,
             WidgetKind::Overview => 8,
-            WidgetKind::Todos => 3,
             WidgetKind::MemoryActivity => 3,
             WidgetKind::SwarmStatus => 3,
             WidgetKind::Compaction => 3,
@@ -183,6 +178,7 @@ impl WidgetKind {
             WidgetKind::ModelInfo => 1,
             WidgetKind::Tips => 3,
             WidgetKind::GitStatus => 1,
+            WidgetKind::CloudVm => 16,
             WidgetKind::Commits => 1,
         }
     }
@@ -193,7 +189,6 @@ impl WidgetKind {
             WidgetKind::Diagrams,
             WidgetKind::WorkspaceMap,
             WidgetKind::Overview,
-            WidgetKind::Todos,
             WidgetKind::UsageLimits,
             WidgetKind::KvCache,
             WidgetKind::MemoryActivity,
@@ -201,6 +196,7 @@ impl WidgetKind {
             WidgetKind::Compaction,
             WidgetKind::BackgroundTasks,
             WidgetKind::GitStatus,
+            WidgetKind::CloudVm,
             WidgetKind::Commits,
             WidgetKind::SwarmStatus,
             WidgetKind::AmbientMode,
@@ -213,7 +209,6 @@ impl WidgetKind {
             WidgetKind::Diagrams => "diagrams",
             WidgetKind::WorkspaceMap => "workspace",
             WidgetKind::Overview => "overview",
-            WidgetKind::Todos => "todos",
             WidgetKind::MemoryActivity => "memory",
             WidgetKind::SwarmStatus => "swarm",
             WidgetKind::BackgroundTasks => "background",
@@ -224,6 +219,7 @@ impl WidgetKind {
             WidgetKind::ModelInfo => "model",
             WidgetKind::Tips => "tips",
             WidgetKind::GitStatus => "git",
+            WidgetKind::CloudVm => "cloud",
             WidgetKind::Commits => "commits",
         }
     }
@@ -248,8 +244,7 @@ impl Side {
 pub(crate) fn is_overview_mergeable(kind: WidgetKind) -> bool {
     matches!(
         kind,
-        WidgetKind::Todos
-            | WidgetKind::SwarmStatus
+        WidgetKind::SwarmStatus
             | WidgetKind::BackgroundTasks
             | WidgetKind::Compaction
             | WidgetKind::ModelInfo
@@ -290,8 +285,6 @@ pub struct SwarmInfo {
     pub selected: usize,
     /// Whether the swarm panel/dock has keyboard focus.
     pub focused: bool,
-    /// Swarm plan progress (completed, running, total), when a plan is active.
-    pub plan_progress: Option<(u32, u32, u32)>,
     /// Spinner frame for animating active agents' status glyphs.
     pub spinner_frame: usize,
 }
@@ -673,17 +666,6 @@ const PAGE_SWITCH_SECONDS: u64 = 30;
 /// Data to display in the info widget
 #[derive(Debug, Default, Clone)]
 pub struct InfoWidgetData {
-    pub todos: Vec<TodoItem>,
-    /// Goal-level assessments (closed feedback loop and objective)
-    /// keyed by todo group (`group: None` covers the ungrouped list). Empty
-    /// when the session has no recorded goals or `todos` is a swarm-plan
-    /// projection.
-    pub todo_goals: Vec<crate::todo::TodoGoal>,
-    /// True when `todos` is actually a projection of the shared swarm plan
-    /// (task DAG) rather than this session's private todo list. The widget
-    /// renders a "Plan" header instead of "Todos" so the two are not
-    /// conflated.
-    pub todos_are_swarm_plan: bool,
     pub context_info: Option<ContextInfo>,
     /// True when context state is being updated and no authoritative snapshot is available.
     pub context_info_stale: bool,
@@ -744,6 +726,11 @@ pub struct InfoWidgetData {
     pub is_compacting: bool,
     /// Git repository status
     pub git_info: Option<GitInfo>,
+    /// Machine telemetry is only present for native SSH attachments.
+    pub cloud_info: Option<CloudStatusInfo>,
+    /// Live transport startup/reconnect state overrides cached probe readiness.
+    pub cloud_connection: Option<String>,
+    pub cloud_working: bool,
     /// Independent local and VM snapshots when this TUI is attached over SSH.
     pub dual_git_info: Option<DualGitInfo>,
     /// Absolute paths the agent edited this session (edit-style tool calls),
@@ -766,14 +753,14 @@ impl InfoWidgetData {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.todos.is_empty()
-            && self.context_info.is_none()
+        self.context_info.is_none()
             && self.queue_mode.is_none()
             && self.model.is_none()
             && self.memory_info.is_none()
             && self.swarm_info.is_none()
             && self.background_info.is_none()
             && self.diagrams.is_empty()
+            && self.cloud_info.is_none()
             && self.workspace_rows.is_empty()
     }
 
@@ -791,9 +778,6 @@ impl InfoWidgetData {
                 // Status-line facts (model, context %, branch) never count:
                 // the overview only joins detail sections.
                 if runtime_has_data(self) {
-                    sections += 1;
-                }
-                if !self.todos.is_empty() {
                     sections += 1;
                 }
                 if self
@@ -831,10 +815,12 @@ impl InfoWidgetData {
                 {
                     sections += 1;
                 }
+                if self.cloud_info.is_some() {
+                    sections += 1;
+                }
                 // Only useful as a "join" mode when there are multiple sections.
                 sections >= 2
             }
-            WidgetKind::Todos => !self.todos.is_empty(),
             WidgetKind::MemoryActivity => self
                 .memory_info
                 .as_ref()
@@ -871,6 +857,7 @@ impl InfoWidgetData {
                         .map(changes_has_data)
                         .unwrap_or(false)
             }
+            WidgetKind::CloudVm => self.cloud_info.is_some(),
             WidgetKind::Commits => self
                 .git_info
                 .as_ref()
@@ -907,7 +894,7 @@ impl InfoWidgetData {
                 if max_pct >= 80 {
                     1 // Very high - right after diagrams
                 } else if max_pct >= 50 {
-                    3 // Elevated - after overview and todos
+                    3 // Elevated - after overview
                 } else {
                     kind.priority()
                 }
@@ -927,7 +914,7 @@ impl InfoWidgetData {
             WidgetKind::SwarmStatus => {
                 // A session actively managing agents wants them visible: the
                 // dock is the cockpit for the swarm, so rank it just under
-                // todos while any managed agent is still live.
+                // other widgets while any managed agent is still live.
                 let managing = self
                     .swarm_info
                     .as_ref()
@@ -1114,7 +1101,7 @@ pub fn calculate_placements(
         None => return Vec::new(),
     };
 
-    let outcome = super::info_widget_layout::calculate_placements_anchored(
+    let outcome = calculate_placements_with_cloud_reflow(
         messages_area,
         margins,
         data,
@@ -1127,6 +1114,46 @@ pub fn calculate_placements(
         state.swarm_dock_last_engaged = Some(Instant::now());
     }
     outcome.visible
+}
+
+/// Repack cloud details only when asynchronously loaded Overview rows cannot
+/// grow inside their original anchor. Keep the resident layout unless a fresh
+/// priority pass fits the full Overview without losing any visible widget.
+pub(super) fn calculate_placements_with_cloud_reflow(
+    area: Rect,
+    margins: &Margins,
+    data: &InfoWidgetData,
+    enabled: bool,
+    anchors: &[super::info_widget_layout::WidgetAnchor],
+) -> super::info_widget_layout::PlacementOutcome {
+    use super::info_widget_layout::calculate_placements_anchored;
+    let resident = calculate_placements_anchored(area, margins, data, enabled, anchors);
+    if data.cloud_info.is_none() || anchors.is_empty() {
+        return resident;
+    }
+    let Some(overview) = resident
+        .visible
+        .iter()
+        .find(|p| p.kind == WidgetKind::Overview)
+    else {
+        return resident;
+    };
+    let needed =
+        calculate_widget_height(WidgetKind::Overview, data, overview.rect.width, area.height);
+    if overview.rect.height >= needed {
+        return resident;
+    }
+    let fresh = calculate_placements_anchored(area, margins, data, enabled, &[]);
+    let fits = fresh.visible.iter().any(|p| {
+        p.kind == WidgetKind::Overview
+            && p.rect.height
+                >= calculate_widget_height(WidgetKind::Overview, data, p.rect.width, area.height)
+    });
+    let preserves = resident
+        .visible
+        .iter()
+        .all(|old| fresh.visible.iter().any(|new| new.kind == old.kind));
+    if fits && preserves { fresh } else { resident }
 }
 
 /// How long after a scroll the transcript still counts as moving for resident
@@ -1471,13 +1498,6 @@ fn render_overview_framed(data: &InfoWidgetData, inner: Rect) -> Option<Framed> 
 
     let title = match page.kind {
         InfoPageKind::CompactOnly => "Overview",
-        InfoPageKind::TodosExpanded => {
-            if data.todos_are_swarm_plan {
-                "Overview · plan"
-            } else {
-                "Overview · todos"
-            }
-        }
         InfoPageKind::MemoryExpanded => "Overview · memory",
     };
     let mut framed = Framed::body(lines).title(frame::label(title));
@@ -1668,7 +1688,6 @@ fn render_widget_content(kind: WidgetKind, data: &InfoWidgetData, inner: Rect) -
         WidgetKind::Diagrams | WidgetKind::WorkspaceMap | WidgetKind::Overview => {
             return Framed::default();
         }
-        WidgetKind::Todos => render_todos_widget(data, inner),
         WidgetKind::MemoryActivity => render_memory_widget(data, inner),
         WidgetKind::SwarmStatus => render_swarm_widget(data, inner),
         WidgetKind::BackgroundTasks => render_background_widget(data, inner),
@@ -1688,6 +1707,7 @@ fn render_widget_content(kind: WidgetKind, data: &InfoWidgetData, inner: Rect) -
         WidgetKind::ModelInfo => render_model_widget(data, inner),
         WidgetKind::Tips => render_tips_widget(inner),
         WidgetKind::GitStatus => render_changes_framed(data, inner),
+        WidgetKind::CloudVm => super::info_widget_cloud::render_cloud_widget(data, inner),
         WidgetKind::Commits => render_commits_widget(data, inner),
     };
     framed.settle()
@@ -2115,9 +2135,6 @@ pub fn render(frame: &mut Frame, rect: Rect, data: &InfoWidgetData) {
 fn render_page(kind: InfoPageKind, data: &InfoWidgetData, inner: Rect) -> Vec<Line<'static>> {
     match kind {
         InfoPageKind::CompactOnly => render_sections(data, inner, None),
-        InfoPageKind::TodosExpanded => {
-            render_sections(data, inner, Some(InfoPageKind::TodosExpanded))
-        }
         InfoPageKind::MemoryExpanded => {
             render_sections(data, inner, Some(InfoPageKind::MemoryExpanded))
         }
@@ -2155,14 +2172,6 @@ fn render_sections(
     // the overscroll status line and are never repeated here.
     lines.extend(render_model_info(data, inner));
 
-    if !data.todos.is_empty() {
-        if matches!(focus, Some(InfoPageKind::TodosExpanded)) {
-            lines.extend(render_todos_expanded(data, inner));
-        } else {
-            lines.extend(render_todos_compact(data, inner));
-        }
-    }
-
     // Memory info
     if let Some(info) = &data.memory_info
         && (info.total_count > 0 || info.activity.is_some())
@@ -2196,12 +2205,20 @@ fn render_sections(
         lines.extend(render_git_widget(data, inner));
     }
 
+    lines.extend(super::info_widget_cloud::render_cloud_summary(
+        data,
+        inner.width,
+    ));
     lines
 }
 
 // ---------------------------------------------------------------------------
 // Tips widget - rotating helpful tips and keyboard shortcuts
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "info_widget_cloud_reflow_tests.rs"]
+mod cloud_reflow_tests;
 
 #[cfg(test)]
 #[path = "info_widget_startup_tests.rs"]

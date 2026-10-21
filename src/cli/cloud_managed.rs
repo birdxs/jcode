@@ -20,8 +20,6 @@ use std::time::{Duration, Instant};
 
 /// Reserved host alias for the account's managed machine.
 pub(crate) const HOST: &str = "jcode-cloud";
-/// Jcode release installed on the machine when its version is older.
-pub(crate) const REMOTE_RELEASE: &str = "v0.99.0";
 const DEFAULT_API_BASE: &str = "https://api.jcode.sh/v1";
 const PROVISION_DEADLINE: Duration = Duration::from_secs(10 * 60);
 const POLL_INTERVAL: Duration = Duration::from_secs(4);
@@ -82,7 +80,55 @@ pub(crate) fn ssh_args() -> Result<Vec<String>> {
         }
     }
     let exe = std::env::current_exe().context("locate the jcode binary")?;
-    let config = format!(
+    let namespace = account()
+        .ok()
+        .and_then(|account| control_namespace(&account.key, &account.base));
+    let config = managed_ssh_config(&dir, &key, &known_hosts_path()?, &exe, namespace.as_deref());
+    let path = ssh_config_path()?;
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(config.as_str()) {
+        write_private(&path, &config)?;
+    }
+    Ok(vec!["-F".into(), path.to_string_lossy().into_owned()])
+}
+
+fn control_namespace(key: &str, base: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    hash.update(key.as_bytes());
+    hash.update([0]);
+    hash.update(base.trim_end_matches('/').as_bytes());
+    Some(format!("{:x}", hash.finalize())[..16].to_string())
+}
+
+fn managed_ssh_config(
+    dir: &std::path::Path,
+    key: &std::path::Path,
+    known: &std::path::Path,
+    exe: &std::path::Path,
+    namespace: Option<&str>,
+) -> String {
+    // Keep the socket in the mode-0700 managed directory, never a shared temp
+    // directory. %C keeps its name short and keys it to the SSH destination.
+    // Escape literal percent signs in the directory before adding SSH's token.
+    let multiplexing = if let Some(namespace) = namespace {
+        let control = format!(
+            "{}/{namespace}-%C",
+            dir.to_string_lossy().replace('%', "%%")
+        );
+        format!(
+            "  ControlMaster auto\n  ControlPath {}\n  ControlPersist 60\n",
+            ssh_quote(&control)
+        )
+    } else {
+        // Never reuse an earlier account's authenticated connection when signed out.
+        "  ControlMaster no\n  ControlPath none\n  ControlPersist no\n".to_string()
+    };
+    format!(
         "# Managed by jcode. Rewritten on every use.\n\
          Host {HOST}\n\
          \x20 HostName {HOST}\n\
@@ -95,17 +141,13 @@ pub(crate) fn ssh_args() -> Result<Vec<String>> {
          \x20 StrictHostKeyChecking yes\n\
          \x20 HostKeyAlias {HOST}\n\
          \x20 ProxyCommand {exe} --no-update --no-selfdev cloud proxy\n\
+         {multiplexing}\
          \x20 ServerAliveInterval 30\n\
          \x20 ServerAliveCountMax 3\n",
         key = ssh_quote(&key.to_string_lossy()),
-        known = ssh_quote(&known_hosts_path()?.to_string_lossy()),
+        known = ssh_quote(&known.to_string_lossy()),
         exe = ssh_quote(&exe.to_string_lossy()),
-    );
-    let path = ssh_config_path()?;
-    if std::fs::read_to_string(&path).ok().as_deref() != Some(config.as_str()) {
-        write_private(&path, &config)?;
-    }
-    Ok(vec!["-F".into(), path.to_string_lossy().into_owned()])
+    )
 }
 
 fn ssh_quote(value: &str) -> String {
@@ -357,34 +399,226 @@ fn raw_stdout() -> std::io::Stdout {
     std::io::stdout()
 }
 
-/// Shell script run on the machine before a move: keep its Jcode on a release
-/// that speaks the move protocol, and make sure `home` exists so repos are
-/// restored at the same absolute path as on this computer.
-pub(crate) fn prepare_script(home: &str) -> String {
-    let home = home.replace('\'', "");
+/// Select an exact published tag, never a guessed fallback for a development build.
+/// The override is read locally, not from the remote host's environment.
+fn release_target(
+    release_build: bool,
+    semver: &str,
+    override_tag: Option<&str>,
+) -> Result<Option<String>> {
+    let value = match override_tag {
+        Some(value) => value,
+        None if release_build => semver,
+        None => return Ok(None),
+    };
+    let version = value.strip_prefix('v').unwrap_or(value);
+    let parts: Vec<_> = version.split('.').collect();
+    if parts.len() != 3
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || !part.bytes().all(|b| b.is_ascii_digit())
+                || (part.len() > 1 && part.starts_with('0'))
+                || part.parse::<u64>().is_err()
+        })
+    {
+        bail!("JCODE_CLOUD_RELEASE must be an exact release tag such as v0.99.123 (got {value:?})");
+    }
+    Ok(Some(format!("v{version}")))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Preflight runs before secrets are transferred. A release client pins its own
+/// runtime release identity; development clients only probe unless explicitly
+/// given JCODE_CLOUD_RELEASE. Existing daemons/sessions are never restarted.
+pub(crate) fn prepare_script(home: &str) -> Result<String> {
+    let override_tag = std::env::var("JCODE_CLOUD_RELEASE").ok();
+    let target = release_target(
+        jcode_build_meta::is_release_build(),
+        jcode_build_meta::semver(),
+        override_tag.as_deref(),
+    )?;
+    Ok(prepare_script_for_paths(
+        home,
+        target.as_deref(),
+        "/opt/jcode-cloud/jcode",
+        true,
+    ))
+}
+
+fn prepare_script_for_paths(
+    home: &str,
+    target: Option<&str>,
+    backend: &str,
+    elevate: bool,
+) -> String {
+    let backend = shell_quote(backend);
+    let privilege = if elevate { "sudo -n " } else { "" };
+    let home = shell_quote(home);
+    let want = shell_quote(target.unwrap_or(""));
     format!(
         r#"set -eu
-want='{REMOTE_RELEASE}'
-current=$(/opt/jcode-cloud/jcode --version 2>/dev/null | head -n1 || true)
-if ! /opt/jcode-cloud/jcode cloud receive --help >/dev/null 2>&1 || [ "${{JCODE_CLOUD_FORCE_UPGRADE:-}}" = 1 ]; then
-  echo "[cloud prepare] updating jcode on the cloud machine ($current -> $want)" >&2
-  tmp=$(mktemp -d)
+want={want}
+export PATH="$HOME/.local/bin:$PATH"
+cli="$HOME/.local/bin/jcode"
+# Preserve the VM's CLI/service wrappers and their host-specific environment.
+# Both wrappers delegate to this stable backend, which also affects the next
+# natural daemon start without disrupting the current daemon or live sessions.
+backend={backend}
+root="$HOME/.local/share/jcode/cloud-releases"
+mkdir -p "$HOME/.local/bin" "$root"
+# Serialize cooperating preflights without terminating any running process.
+lock="$root/.prepare-lock"
+if ! mkdir "$lock" 2>/dev/null; then
+  echo '[cloud prepare] another upgrade is running; retry after it finishes' >&2
+  exit 1
+fi
+stage=
+backup=
+next=
+switched=0
+had_previous=0
+committed=0
+cleanup() {{
+  rc=$?
+  trap - EXIT HUP INT TERM
+  if [ "$switched" = 1 ] && [ "$committed" = 0 ]; then
+    rollback_ok=1
+    if [ "$had_previous" = 1 ]; then
+      if ! {privilege}mv -Tf "$backup" "$backend"; then
+        echo "[cloud prepare] rollback failed; recovery files retained in $stage and $backup" >&2
+        stage=
+        rollback_ok=0
+        rc=1
+      fi
+    else
+      if ! {privilege}rm -f "$backend"; then
+        echo "[cloud prepare] rollback failed; installed files retained in $stage" >&2
+        stage=
+        rollback_ok=0
+        rc=1
+      fi
+    fi
+    if [ "$rollback_ok" = 1 ]; then
+      echo '[cloud prepare] verification failed; restored previous CLI' >&2
+    fi
+  fi
+  if [ -n "$next" ]; then {privilege}rm -f "$next" || true; fi
+  # Keep installed releases and the previous binary for rollback/recovery.
+  if [ -n "$stage" ] && [ "$committed" = 0 ]; then rm -rf "$stage"; fi
+  rmdir "$lock" || true
+  exit "$rc"
+}}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+probe() {{
+  # Do not let a fast-release parent identity mask the candidate's real version.
+  env -u JCODE_RUNTIME_RELEASE_SEMVER -u JCODE_RUNTIME_RELEASE_GIT_HASH \
+    -u JCODE_RUNTIME_RELEASE_GIT_DATE -u JCODE_RUNTIME_RELEASE_GIT_TAG \
+    "$1" --no-update --no-selfdev "$2" "${{3:-}}" "${{4:-}}"
+}}
+capable() {{
+  probe "$1" cloud receive --help >/dev/null 2>&1 &&
+    probe "$1" cloud credentials --help >/dev/null 2>&1 &&
+    probe "$1" cloud cancel-return --help >/dev/null 2>&1
+}}
+version_output() {{
+  env -u JCODE_RUNTIME_RELEASE_SEMVER -u JCODE_RUNTIME_RELEASE_GIT_HASH \
+    -u JCODE_RUNTIME_RELEASE_GIT_DATE -u JCODE_RUNTIME_RELEASE_GIT_TAG \
+    "$1" --no-update --no-selfdev --version 2>/dev/null
+}}
+version_matches() {{
+  version=$(version_output "$1") || return 1
+  case "$version" in
+    "jcode $want"|"jcode $want "*|"$want"|"$want "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}}
+version_at_least() {{
+  version=$(version_output "$1") || return 1
+  # A newer compatible stable release need not be downgraded. Compare decimal
+  # components as strings to avoid floating-point/lexicographic version errors.
+  printf '%s\n' "$version" | awk -v want="$want" '
+    NR == 1 {{ version = ($1 == "jcode" ? $2 : $1) }}
+    END {{
+      if (NR != 1 || version !~ /^v[0-9]+\.[0-9]+\.[0-9]+$/) exit 1;
+      sub(/^v/, "", version); sub(/^v/, "", want);
+      split(version, a, /[.]/); split(want, b, /[.]/);
+      for (i=1; i<=3; i++) {{
+        sub(/^0+/, "", a[i]); sub(/^0+/, "", b[i]);
+        if (length(a[i]) != length(b[i])) exit (length(a[i]) > length(b[i]) ? 0 : 1);
+        if ("x" a[i] != "x" b[i]) exit ("x" a[i] > "x" b[i] ? 0 : 1);
+      }}
+      exit 0;
+    }}'
+}}
+if ! capable "$cli" || ! capable "$backend" || {{ [ -n "$want" ] && {{ ! version_at_least "$cli" || ! version_at_least "$backend"; }}; }} || [ "${{JCODE_CLOUD_FORCE_UPGRADE:-}}" = 1 ]; then
+  if [ -z "$want" ]; then
+    echo '[cloud prepare] cloud CLI lacks required capabilities, or upgrade was forced. Development clients do not choose a release automatically. Set JCODE_CLOUD_RELEASE to an exact compatible published tag.' >&2
+    exit 1
+  fi
+  [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || {{
+    echo '[cloud prepare] release requires Linux x86_64' >&2; exit 1;
+  }}
+  echo "[cloud prepare] installing verified $want CLI (live sessions are unchanged)" >&2
+  stage=$(mktemp -d "$root/$want.XXXXXXXX")
   base="https://github.com/1jehuang/jcode/releases/download/$want"
-  curl -fsSL --retry 3 "$base/jcode-linux-x86_64.tar.gz" -o "$tmp/jcode.tgz"
-  curl -fsSL --retry 3 "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"
-  (cd "$tmp" && grep ' jcode-linux-x86_64.tar.gz$' SHA256SUMS | sed 's/ .*//; s/$/  jcode.tgz/' | sha256sum --check --quiet -)
-  sudo install -d -m 755 "/opt/jcode-cloud/$want"
-  sudo tar xzf "$tmp/jcode.tgz" -C "/opt/jcode-cloud/$want"
-  if [ -x "/opt/jcode-cloud/$want/jcode-linux-x86_64" ]; then entry=jcode-linux-x86_64; else entry=$(ls "/opt/jcode-cloud/$want" | head -n1); fi
-  sudo ln -sfn "$want/$entry" /opt/jcode-cloud/jcode
-  rm -rf "$tmp"
-  XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart jcode-cloud.service || true
-  for i in $(seq 1 60); do [ -S /run/user/$(id -u)/jcode.sock ] && break; sleep 1; done
+  asset=jcode-linux-x86_64.tar.gz
+  curl --proto '=https' --tlsv1.2 -fsSL --retry 3 "$base/$asset" -o "$stage/$asset"
+  curl --proto '=https' --tlsv1.2 -fsSL --retry 3 "$base/SHA256SUMS" -o "$stage/SHA256SUMS"
+  # Accept exactly one checksum for exactly this asset, never arbitrary paths.
+  awk -v asset="$asset" '
+    $2 == asset || $2 == "*" asset {{
+      if (length($1) != 64 || $1 ~ /[^0-9a-fA-F]/) exit 1;
+      hash=$1; count++
+    }}
+    END {{ if (count != 1) exit 1; print hash "  " asset }}
+  ' "$stage/SHA256SUMS" > "$stage/checksum"
+  (cd "$stage" && sha256sum --check --status checksum)
+  # The manylinux artifact is flat: wrapper, real executable, optional OpenSSL
+  # libraries. Reject directories, links, devices and unexpected/traversal names.
+  tar tzf "$stage/$asset" > "$stage/members"
+  awk '
+    $0 !~ /^(jcode-linux-x86_64(\.bin)?|lib(ssl|crypto)\.so[.0-9A-Za-z_-]*)$/ {{ exit 1 }}
+    seen[$0]++ {{ exit 1 }}
+    END {{ if (!seen["jcode-linux-x86_64"] || !seen["jcode-linux-x86_64.bin"]) exit 1 }}
+  ' "$stage/members"
+  tar tvzf "$stage/$asset" > "$stage/types"
+  awk 'substr($0,1,1) != "-" {{ exit 1 }}' "$stage/types"
+  mkdir "$stage/bin"
+  tar xzf "$stage/$asset" --no-same-owner --no-same-permissions -C "$stage/bin"
+  candidate="$stage/bin/jcode-linux-x86_64"
+  [ -f "$candidate" ] && [ -f "$candidate.bin" ]
+  chmod 755 "$candidate" "$candidate.bin"
+  capable "$candidate" && version_matches "$candidate" || {{
+    echo '[cloud prepare] downloaded release lacks required protocol capabilities or exact version' >&2; exit 1;
+  }}
+  # Save regular files as well as symlinks, without changing their original target.
+  if [ -e "$backend" ] || [ -L "$backend" ]; then
+    [ ! -d "$backend" ] || {{ echo '[cloud prepare] backend path is a directory' >&2; exit 1; }}
+    backup="$backend.previous.$(basename "$stage")"
+    {privilege}cp -Pp "$backend" "$backup"
+    had_previous=1
+  fi
+  {privilege}install -d -m 755 "$(dirname "$backend")"
+  # Stage the new symlink beside its destination so rename is atomic even when
+  # /opt and the user's home directory live on different filesystems.
+  next="$backend.next.$(basename "$stage")"
+  {privilege}ln -s "$candidate" "$next"
+  # Arm rollback before rename, including interruption immediately after rename.
+  switched=1
+  {privilege}mv -Tf "$next" "$backend"
+  capable "$backend" && version_matches "$backend" && capable "$cli" && version_matches "$cli" || exit 1
 fi
-if [ -n '{home}' ] && [ ! -d '{home}' ]; then
-  sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 755 '{home}'
+# All handoff protocols are mandatory even when credentials are not needed yet.
+capable "$cli" || {{ echo '[cloud prepare] cloud receive, credentials and cancel-return are required' >&2; exit 1; }}
+committed=1
+if [ -n {home} ] && [ ! -d {home} ]; then
+  sudo -n install -d -o "$(id -un)" -g "$(id -gn)" -m 755 {home}
 fi
-command -v git >/dev/null || sudo dnf install -y git >/dev/null
+command -v git >/dev/null || sudo -n dnf install -y git >/dev/null
 "#
     )
 }
@@ -432,6 +666,10 @@ fn write_private(path: &std::path::Path, contents: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "cloud_managed_tests.rs"]
+mod upgrade_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -454,10 +692,64 @@ mod tests {
 
     #[test]
     fn prepare_script_targets_release_and_home() {
-        let script = prepare_script("/home/me");
-        assert!(script.contains(REMOTE_RELEASE));
+        let script = prepare_script_for_paths(
+            "/home/me",
+            Some("v0.99.123"),
+            "/opt/jcode-cloud/jcode",
+            true,
+        );
+        assert!(script.contains("want='v0.99.123'"));
         assert!(script.contains("'/home/me'"));
         assert!(script.contains("cloud receive --help"));
+    }
+
+    #[test]
+    fn managed_config_multiplexes_in_private_directory() {
+        let dir = std::path::Path::new("/home/test user/100%/cloud");
+        let config = managed_ssh_config(
+            dir,
+            &dir.join("id_ed25519"),
+            &dir.join("known_hosts"),
+            std::path::Path::new("/opt/jcode"),
+            Some("0123456789abcdef"),
+        );
+        assert!(config.contains("  ControlMaster auto\n"));
+        assert!(
+            config.contains("  ControlPath \"/home/test user/100%%/cloud/0123456789abcdef-%C\"\n")
+        );
+        assert!(config.contains("  ControlPersist 60\n"));
+        assert!(config.contains("  StrictHostKeyChecking yes\n"));
+        assert!(config.contains("  IdentityAgent none\n"));
+    }
+
+    #[test]
+    fn control_namespace_is_account_and_endpoint_scoped() {
+        let namespace = control_namespace("secret-a", DEFAULT_API_BASE).unwrap();
+        assert_eq!(namespace.len(), 16);
+        assert!(namespace.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            Some(namespace.clone()),
+            control_namespace(" secret-a ", DEFAULT_API_BASE)
+        );
+        assert_ne!(
+            Some(namespace.clone()),
+            control_namespace("secret-b", DEFAULT_API_BASE)
+        );
+        assert_ne!(
+            Some(namespace),
+            control_namespace("secret-a", "https://other.example/v1")
+        );
+        assert_eq!(control_namespace("  ", DEFAULT_API_BASE), None);
+    }
+
+    #[test]
+    fn managed_config_disables_multiplexing_without_account() {
+        let path = std::path::Path::new("/private/cloud");
+        let config = managed_ssh_config(path, path, path, path, None);
+        assert!(config.contains("  ControlMaster no\n"));
+        assert!(config.contains("  ControlPath none\n"));
+        assert!(config.contains("  ControlPersist no\n"));
+        assert!(!config.contains("%C"));
     }
 
     #[test]

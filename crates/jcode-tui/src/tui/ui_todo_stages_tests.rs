@@ -1,6 +1,24 @@
 use super::*;
 use crate::todo::TodoItem;
 
+#[test]
+fn inactive_lanes_keep_ownership_without_live_activity() {
+    for status in ["completed", "pending"] {
+        let mut item = assigned(todo("1", "Read types", status, None), "fox");
+        item.group = Some("Parser".into());
+        let agents = vec![agent("fox", "running", Some("Working elsewhere"), Some(12))];
+        let rows = render(&[item], &agents, 120);
+        assert_eq!(rows.join("\n").matches('🦊').count(), 1, "{rows:?}");
+        assert!(!rows.join("\n").contains("Working elsewhere"), "{rows:?}");
+        assert!(!rows.join("\n").contains("12s"), "{rows:?}");
+    }
+    let mut done = assigned(todo("1", "Finished", "completed", None), "fox");
+    done.group = Some("Parser".into());
+    let agents = vec![agent("fox", "failed", Some("Failure elsewhere"), Some(12))];
+    let rows = render(&[done], &agents, 120);
+    assert!(!rows.join("\n").contains("Failure elsewhere"), "{rows:?}");
+}
+
 fn todo(id: &str, content: &str, status: &str, stage: Option<u32>) -> TodoItem {
     TodoItem {
         id: id.to_string(),
@@ -24,6 +42,7 @@ fn agent(name: &str, status: &str, activity: Option<&str>, age: Option<u64>) -> 
         status: status.to_string(),
         activity: activity.map(str::to_string),
         age_secs: age,
+        activity_age_secs: age,
     }
 }
 
@@ -92,11 +111,16 @@ fn header_labels_each_phase_with_its_pips() {
         "{rows:?}"
     );
     let trimmed: Vec<&str> = rows.iter().map(|r| r.trim()).collect();
-    // Finished phase 1 lives on the header only; ungrouped todos are lanes of
-    // their own, each led by its status.
+    // Every phase is listed; ungrouped todos are lanes of their own, each
+    // led by its status.
     assert_eq!(
         &trimmed[1..],
-        &["●  stage field", "●  pinned band", "○  integrate"],
+        &[
+            "●  read types",
+            "●  stage field",
+            "●  pinned band",
+            "○  integrate"
+        ],
         "{rows:?}"
     );
     let joined = rows.join("\n");
@@ -175,8 +199,8 @@ fn lane_row_shows_agent_emoji_and_activity() {
         eprintln!("--- {width}\n{}", rows.join("\n"));
         assert_fits(&rows, width);
         assert!(
-            rows[0].contains("🦊") && rows[0].contains("🐑"),
-            "roster: {rows:?}"
+            !rows[0].contains("🦊") && !rows[0].contains("🐑"),
+            "lane owners should not repeat in header: {rows:?}"
         );
     }
     let rows = render(&todos, &agents, 120);
@@ -189,7 +213,7 @@ fn lane_row_shows_agent_emoji_and_activity() {
 }
 
 #[test]
-fn finished_phases_stay_on_the_header_until_all_done() {
+fn finished_phases_keep_their_lanes() {
     let mut todos = grid_todos();
     todos.push(laned("Wrap up", "pending", 3, "release"));
     for todo in todos.iter_mut().take(9) {
@@ -198,11 +222,9 @@ fn finished_phases_stay_on_the_header_until_all_done() {
     let rows = render(&todos, &[], 100);
     eprintln!("{}", rows.join("\n"));
     assert_eq!(rows[0].trim(), "phase 1 ●●●●●●  phase 2 ●●●  phase 3 ○");
-    assert_eq!(rows.len(), 2, "body shows only the open phase: {rows:?}");
-    assert!(rows[1].contains("Wrap up"), "{rows:?}");
-    todos[9].status = "completed".into();
-    let rows = render(&todos, &[], 100);
+    assert_eq!(rows.len(), 1 + 6, "every phase keeps its lanes: {rows:?}");
     assert!(rows.iter().any(|r| r.contains("Extract lexer")), "{rows:?}");
+    assert!(rows.last().unwrap().contains("Wrap up"), "{rows:?}");
 }
 
 #[test]
@@ -265,4 +287,261 @@ fn unknown_agent_falls_back_to_name_emoji_and_never_overflows() {
         rows[2].trim_end().ends_with('z') && !rows[2].contains('💫'),
         "{rows:?}"
     );
+}
+
+#[test]
+fn lanes_of_later_phases_are_dimmed() {
+    crate::tui::markdown::set_center_code_blocks(false);
+    let payload = serde_json::json!({ "todos": grid_todos(), "plan": {}, "goals": [] });
+    let msg = DisplayMessage::todos(payload.to_string());
+    let lines = render_pinned_todos_message(&msg, 100, crate::config::DiffDisplayMode::Off);
+    let style_of = |needle: &str| {
+        let line = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.contains(needle)))
+            .unwrap();
+        line.spans
+            .iter()
+            .find(|span| span.content.contains(needle))
+            .unwrap()
+            .style
+    };
+    let dim = Some(rgb(105, 100, 135));
+    assert_ne!(style_of("parser").fg, dim, "active phase lane stays bright");
+    assert_eq!(
+        style_of("integration").fg,
+        dim,
+        "later phase lane is dimmed"
+    );
+    assert_eq!(style_of("Build and commit").fg, dim);
+    // Lane names wear their phase label's colour and weight.
+    let bold =
+        |style: ratatui::style::Style| style.add_modifier.contains(ratatui::style::Modifier::BOLD);
+    assert_eq!(style_of("parser").fg, style_of("phase 1").fg);
+    assert!(bold(style_of("parser")) && bold(style_of("phase 1")));
+    assert_eq!(style_of("integration").fg, style_of("phase 2").fg);
+    assert!(!bold(style_of("integration")) && !bold(style_of("phase 2")));
+}
+
+fn live_lane_todos() -> Vec<TodoItem> {
+    let mut todos = grid_todos();
+    todos[1].assigned_to = Some("fox".into()); // parser: in progress
+    todos[3].assigned_to = Some("sheep".into()); // ui: all done
+    todos
+}
+
+#[test]
+fn live_worker_dot_spins_and_quiet_worker_turns_amber() {
+    let agents = vec![
+        agent("fox", "running", Some("justrust test"), Some(12)),
+        agent("sheep", "completed", None, Some(300)),
+    ];
+    let rows = render(&live_lane_todos(), &agents, 120);
+    let parser = rows.iter().find(|r| r.contains("parser")).unwrap();
+    assert!(
+        parser.starts_with("  ●") && parser.contains(LIVE_DOT_SENTINEL),
+        "{rows:?}"
+    );
+    assert!(parser.contains("justrust test · 12s"), "{rows:?}");
+    assert!(
+        !rows
+            .iter()
+            .find(|r| r.contains("ui 🐑"))
+            .unwrap()
+            .contains(LIVE_DOT_SENTINEL),
+        "finished lane does not spin: {rows:?}"
+    );
+
+    // The placeholder is swapped for a spinner frame on draw.
+    crate::tui::markdown::set_center_code_blocks(false);
+    let payload = serde_json::json!({
+        "todos": live_lane_todos(), "plan": {}, "goals": [], "agents": agents
+    });
+    let msg = DisplayMessage::todos(payload.to_string());
+    let mut lines = render_pinned_todos_message(&msg, 120, crate::config::DiffDisplayMode::Off);
+    animate_lane_spinners(&mut lines);
+    let text: String = lines
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+        .collect();
+    assert!(!text.contains(LIVE_DOT_SENTINEL), "sentinel replaced");
+
+    // Quiet for over two minutes: amber age instead of a plain one.
+    let quiet = vec![agent("fox", "running", Some("justrust test"), Some(200))];
+    let rows = render(&live_lane_todos(), &quiet, 120);
+    assert!(
+        rows.iter().any(|r| r.contains("justrust test · quiet 3m")),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn roster_groups_working_agents_before_finished_ones() {
+    let agents = vec![
+        agent("fox", "running", Some("x"), Some(3)),
+        agent("sheep", "completed", None, Some(300)),
+    ];
+    let todos = vec![
+        assigned(todo("1", "queued", "pending", None), "fox"),
+        assigned(todo("2", "finished", "completed", None), "sheep"),
+    ];
+    let rows = render(&todos, &agents, 120);
+    let header = &rows[0];
+    let fox = header.find('🦊').unwrap();
+    let done = header.find("· ✓").unwrap();
+    let sheep = header.find('🐑').unwrap();
+    assert!(fox < done && done < sheep, "{header}");
+    // Nobody working: just the done group.
+    let all_done = vec![
+        agent("fox", "completed", None, None),
+        agent("sheep", "completed", None, None),
+    ];
+    let rows = render(&todos, &all_done, 120);
+    assert!(
+        rows[0].contains("✓ 🦊🐑") && !rows[0].contains('·'),
+        "{:?}",
+        rows[0]
+    );
+}
+
+#[test]
+fn failed_lane_blocks_its_phase_and_offers_retry() {
+    let mut todos = grid_todos();
+    todos[5].status = "in_progress".into(); // docs lane still open
+    todos[5].assigned_to = Some("session_crab_1700000000".into());
+    let agents = vec![agent("crab", "failed", Some("build failed"), Some(5))];
+    let rows = render(&todos, &agents, 120);
+    assert!(rows[0].contains("⏸ phase 1 blocked"), "{rows:?}");
+    let docs = rows.iter().find(|r| r.contains("docs")).unwrap();
+    assert!(docs.contains("✗ build failed · swarm retry"), "{rows:?}");
+    // No failure: no blocked marker.
+    let rows = render(&grid_todos(), &[], 120);
+    assert!(!rows[0].contains("blocked"), "{rows:?}");
+}
+
+#[test]
+fn grouped_checklist_shows_owner_and_activity_only_in_heading() {
+    let mut todos = vec![
+        assigned(todo("1", "Read types", "completed", None), "fox"),
+        assigned(todo("2", "Update callers", "in_progress", None), "fox"),
+        assigned(todo("3", "Add tests", "pending", None), "fox"),
+    ];
+    for todo in &mut todos {
+        todo.group = Some("Parser 界".into());
+    }
+    let agents = vec![agent("fox", "running", Some("Checking callers"), Some(12))];
+    let rows = render(&todos, &agents, 120);
+    let text = rows.join("\n");
+    assert_eq!(text.matches('🦊').count(), 1, "{rows:?}");
+    assert_eq!(text.matches("Checking callers").count(), 1, "{rows:?}");
+    let heading = rows.iter().find(|row| row.contains("Parser 界")).unwrap();
+    assert!(
+        heading.contains('🦊') && heading.contains("Checking callers"),
+        "{rows:?}"
+    );
+    for width in [8, 14, 24, 40, 80] {
+        let narrow = render(&todos, &agents, width);
+        assert_fits(&narrow, width);
+        assert_eq!(narrow.len(), rows.len(), "no wrapping at {width}");
+    }
+}
+
+#[test]
+fn plain_checklist_only_active_row_has_worker_and_duplicate_activity_is_hidden() {
+    let todos = vec![
+        assigned(todo("1", "Read types", "completed", None), "fox"),
+        assigned(todo("2", "Update callers", "in_progress", None), "fox"),
+        assigned(todo("3", "Add tests", "pending", None), "fox"),
+    ];
+    let agents = vec![agent(
+        "fox",
+        "running",
+        Some(" Update   callers "),
+        Some(12),
+    )];
+    let rows = render(&todos, &agents, 120);
+    assert_eq!(rows.join("\n").matches('🦊').count(), 1, "{rows:?}");
+    assert!(
+        rows.iter()
+            .find(|r| r.contains("Update callers"))
+            .unwrap()
+            .contains('🦊')
+    );
+    assert!(!rows.join("\n").contains(" Update   callers "), "{rows:?}");
+    assert!(
+        rows.iter().any(|row| row.contains("12s")),
+        "age is retained: {rows:?}"
+    );
+}
+
+#[test]
+fn compact_lane_hides_activity_identical_to_a_task_title() {
+    let mut todos = live_lane_todos();
+    let agents = vec![agent("fox", "running", Some("Update callers"), Some(12))];
+    let rows = render(&todos, &agents, 160);
+    assert_eq!(
+        rows.join("\n").matches("Update callers").count(),
+        1,
+        "{rows:?}"
+    );
+    for todo in &mut todos {
+        todo.stage = None;
+    }
+    let rows = render(&todos, &agents, 160);
+    assert_eq!(
+        rows.join("\n").matches("Update callers").count(),
+        1,
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn mixed_list_keeps_unrepresented_owners_without_repeating_lane_owners() {
+    let mut grouped = assigned(todo("1", "Read types", "in_progress", None), "fox");
+    grouped.group = Some("Parser".into());
+    let todos = vec![
+        grouped,
+        assigned(todo("2", "Follow up", "pending", None), "fox"),
+        assigned(todo("3", "Documentation", "pending", None), "sheep"),
+    ];
+    let agents = vec![
+        agent("fox", "running", Some("Inspect types"), None),
+        agent("sheep", "queued", None, None),
+    ];
+    let rows = render(&todos, &agents, 120);
+    assert!(!rows[0].contains('🦊'), "{rows:?}");
+    assert!(rows[0].contains('🐑'), "unstarted owner retained: {rows:?}");
+    assert_eq!(rows.join("\n").matches('🦊').count(), 1, "{rows:?}");
+    assert_eq!(rows.join("\n").matches('🐑').count(), 1, "{rows:?}");
+}
+
+#[test]
+fn group_heading_keeps_distinct_owners_once_and_hides_duplicate_failure_reason() {
+    let mut todos = vec![
+        assigned(todo("1", "修复 parser", "in_progress", None), "fox"),
+        assigned(todo("2", "Add tests", "pending", None), "fox"),
+        assigned(todo("3", "Review", "pending", None), "sheep"),
+    ];
+    for todo in &mut todos {
+        todo.group = Some("解析器".into());
+    }
+    let agents = vec![
+        agent("fox", "failed", Some("修复 parser"), None),
+        agent("sheep", "queued", None, None),
+    ];
+    let refs: Vec<_> = todos.iter().collect();
+    for width in [1, 8, 14, 40, 120] {
+        let row = render_group_header("解析器", &refs, &agents, "", width);
+        assert!(row.width() <= width);
+        let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(!text.contains("修复 parser"), "{text}");
+        if width == 120 {
+            assert_eq!(text.matches('🦊').count(), 1, "{text}");
+            assert_eq!(text.matches('🐑').count(), 1, "{text}");
+            assert!(
+                text.contains("failed") && text.contains("swarm retry"),
+                "{text}"
+            );
+        }
+    }
 }

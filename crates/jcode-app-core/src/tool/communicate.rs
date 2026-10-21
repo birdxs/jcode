@@ -691,14 +691,17 @@ fn try_claim_run_plan_driver(
     })
 }
 
-/// Seed an empty swarm plan from the caller's session todos.
+/// Make the swarm plan mirror the caller's todo list: one item per lane.
 ///
-/// Only runs when the plan has no items, so an explicit `propose_plan` always
-/// wins. Returns quietly when there are no open todos.
-async fn seed_plan_from_todos_if_empty(ctx: &ToolContext) -> Result<()> {
-    if fetch_plan_status(&ctx.session_id)
-        .await
-        .is_ok_and(|summary| summary.item_count > 0)
+/// `launch` calls this every time, so the plan can never drift from the
+/// todos; the server keeps the status and owner of lanes already running.
+/// The legacy `run_plan` only seeds an empty plan, so a hand-written
+/// `propose_plan` still wins there. Returns quietly with no open todos.
+async fn sync_plan_from_todos(ctx: &ToolContext, only_if_empty: bool) -> Result<()> {
+    if only_if_empty
+        && fetch_plan_status(&ctx.session_id)
+            .await
+            .is_ok_and(|summary| summary.item_count > 0)
     {
         return Ok(());
     }
@@ -1102,6 +1105,7 @@ async fn broadcast_plan_alert(ctx: &ToolContext, message: &str) -> Result<()> {
         delivery: None,
         tldr: Some("run_plan paused: credential failure wave; fix auth then retry".to_string()),
         to_swarm: None,
+        require_target: false,
     };
     match send_request(request).await {
         Ok(response) => ensure_success(&response),
@@ -1670,6 +1674,28 @@ impl CommunicateTool {
     }
 }
 
+/// Swarm actions advertised to models. Real usage is dominated by messaging,
+/// reports, listing and spawning; the plan/task-graph actions (propose_plan,
+/// assign_task, assign_next, fill_slots, run_plan, resync_plan, ...) are
+/// subsumed by `launch` and lane-owning `spawn`. Unlisted actions still
+/// execute for old transcripts and scripts, they are just not offered.
+const ADVERTISED_SWARM_ACTIONS: &[&str] = &[
+    "launch",
+    "spawn",
+    "message",
+    "report",
+    "status",
+    "plan_status",
+    "list",
+    "summary",
+    "await_members",
+    "stop",
+    "resume",
+    "retry",
+    "list_models",
+    "list_swarms",
+];
+
 #[derive(Clone, Deserialize)]
 struct CommunicateInput {
     action: String,
@@ -1753,6 +1779,10 @@ struct CommunicateInput {
     /// Required and nonblank for the explicit `spawn` action.
     #[serde(default)]
     label: Option<String>,
+    /// Phase (todo `stage`) a spawned worker's lane joins. Defaults to the
+    /// active phase.
+    #[serde(default, alias = "stage")]
+    phase: Option<u32>,
 }
 
 impl CommunicateInput {
@@ -1792,7 +1822,9 @@ fn canonical_swarm_action(action: &str) -> &str {
     match action.trim().to_ascii_lowercase().as_str() {
         "inbox" | "messages" | "check_messages" | "read_messages" | "read_inbox" => "read",
         "send" | "msg" | "send_message" => "message",
-        "dm_session" | "direct_message" | "whisper" => "dm",
+        // `dm` was its own action; `message` with `to_session` is identical,
+        // so route it there (one way to talk to an agent).
+        "dm" | "dm_session" | "direct_message" | "whisper" => "message",
         "broadcast_all" | "announce" => "broadcast",
         "agents" | "members" | "list_agents" | "list_members" | "roster" => "list",
         "swarms" | "list_swarm" | "swarm_list" => "list_swarms",
@@ -1823,23 +1855,12 @@ impl Tool for CommunicateTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["share", "share_append", "read", "message", "broadcast", "dm", "channel", "list", "list_channels", "channel_members", "list_swarms", "set_swarm_label",
-                             "propose_plan", "approve_plan", "reject_plan", "spawn", "stop", "assign_role",
-                             "status", "report", "plan_status", "summary", "read_context", "resync_plan", "assign_task", "assign_next", "fill_slots", "run_plan", "cleanup",
-                             "start", "start_task", "wake", "resume", "retry", "reassign", "replace", "salvage",
-                             "subscribe_channel", "unsubscribe_channel", "await_members", "list_models"],
-                    "description": "Action. spawn requires label and should include prompt. list_models shows available models/routes."
-                },
-                "key": {
-                    "type": "string",
-                    "description": "Shared-context key for share/share_append/read. Discouraged: prefer the repo and DMs."
-                },
-                "value": {
-                    "type": "string"
+                    "enum": ADVERTISED_SWARM_ACTIONS,
+                    "description": "Action. launch runs your todo list (one agent per lane). spawn starts one worker on a lane; spawn requires label and should include prompt. message sends to one agent (to_session) or a channel; only the coordinator may omit both to message everyone. list_models shows available models/routes."
                 },
                 "message": {
                     "type": "string",
-                    "description": "Message body: DM with to_session, channel post with channel, else broadcast. For report, the body."
+                    "description": "Message body. Goes to to_session, or to channel; with neither, everyone (coordinator only). For report, the body."
                 },
                 "tldr": {
                     "type": "string",
@@ -1869,20 +1890,19 @@ impl Tool for CommunicateTool {
                     "type": "string",
                     "description": "Channel name for channel actions. Discouraged: prefer DMs."
                 },
-                "proposer_session": { "type": "string" },
-                "reason": { "type": "string" },
                 "target_session": {
                     "type": "string",
                     "description": "Session ID or unique friendly name for management actions. Alias of to_session."
                 },
-                "role": {
-                    "type": "string",
-                    "enum": ["agent", "coordinator"]
-                },
                 "label": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Required for spawn: agent chip label (e.g. 'auth refactor'). For set_swarm_label: the new unique label."
+                    "description": "Required for spawn: the worker's lane name (e.g. 'auth refactor'). Each spawned worker owns that lane in your todo list (created from the prompt if missing); its todo list is the lane and syncs only it."
+                },
+                "phase": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "For spawn: which phase the worker's lane belongs to. Defaults to the active phase."
                 },
                 "working_dir": {
                     "type": "string",
@@ -1904,14 +1924,6 @@ impl Tool for CommunicateTool {
                 "task_id": {
                     "type": "string",
                     "description": "Optional plan task ID. When omitted the coordinator picks or resumes the relevant task."
-                },
-                "spawn_if_needed": {
-                    "type": "boolean",
-                    "description": "For assign_task: spawn a fresh agent when no reusable one is available."
-                },
-                "prefer_spawn": {
-                    "type": "boolean",
-                    "description": "For assign_task: prefer spawning fresh over reusing an idle worker."
                 },
                 "spawn_mode": {
                     "type": "string",
@@ -1943,7 +1955,7 @@ impl Tool for CommunicateTool {
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "For run_plan: detach as a background task (default true); false blocks until the plan resolves."
+                    "description": "For launch/run_plan: detach as a background task (default true); false blocks until the plan resolves."
                 },
                 "notify": {
                     "type": "boolean",
@@ -1952,7 +1964,7 @@ impl Tool for CommunicateTool {
                 "concurrency_limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Max live workers. Required for fill_slots; optional override for run_plan."
+                    "description": "Max live workers for launch."
                 },
                 "force": {
                     "type": "boolean",
@@ -1960,7 +1972,7 @@ impl Tool for CommunicateTool {
                 },
                 "retain_agents": {
                     "type": "boolean",
-                    "description": "For run_plan: keep spawned workers after the plan finishes. Defaults to false."
+                    "description": "For launch/run_plan: keep spawned workers after the plan finishes. Defaults to false."
                 },
                 "wake": {
                     "type": "boolean",
@@ -1971,14 +1983,6 @@ impl Tool for CommunicateTool {
                     "enum": ["notify", "interrupt", "wake"],
                     "description": "Optional delivery mode for dm/channel messaging."
                 },
-                "plan_items": {
-                    "type": "array",
-                    "description": "Plan items for propose_plan. run_plan with no plan uses your todo list instead: each group in a stage is a lane that runs in order, lanes run in parallel, later stages wait.",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": true
-                    }
-                }
             }
         });
 
@@ -2113,6 +2117,9 @@ impl Tool for CommunicateTool {
                     delivery: params.delivery,
                     tldr,
                     to_swarm: to_swarm.clone(),
+                    // A worker that forgets `to_session` gets an error rather
+                    // than broadcasting; the coordinator may still message all.
+                    require_target: true,
                 };
 
                 match send_request(request).await {
@@ -2165,6 +2172,7 @@ impl Tool for CommunicateTool {
                     delivery: params.delivery,
                     tldr,
                     to_swarm: None,
+                    require_target: false,
                 };
 
                 match send_request(request).await {
@@ -2203,6 +2211,7 @@ impl Tool for CommunicateTool {
                     wake: params.wake,
                     tldr,
                     to_swarm: to_swarm.clone(),
+                    require_target: false,
                 };
 
                 match send_request(request).await {
@@ -2246,6 +2255,7 @@ impl Tool for CommunicateTool {
                     wake: params.wake,
                     tldr,
                     to_swarm: None,
+                    require_target: false,
                 };
 
                 match send_request(request).await {
@@ -2466,6 +2476,37 @@ impl Tool for CommunicateTool {
 
             "spawn" => {
                 let label = params.required_spawn_label()?;
+                // Every spawned worker owns one lane in the coordinator's todo
+                // list: the lane named `label` in `phase` (default: the active
+                // phase), created from the prompt when it does not exist. The
+                // worker's own todo list is that lane and syncs only it.
+                let prompt = params.spawn_initial_message();
+                let lane_id = {
+                    let todos = crate::todo::load_todos(&ctx.session_id).unwrap_or_default();
+                    let title = prompt
+                        .as_deref()
+                        .and_then(|prompt| prompt.lines().map(str::trim).find(|l| !l.is_empty()))
+                        .map(|line| line.chars().take(60).collect::<String>())
+                        .unwrap_or_else(|| label.clone());
+                    let (updated, lane_id) = crate::todo::stages::ensure_spawn_lane(
+                        &todos,
+                        &label,
+                        params.phase,
+                        &title,
+                        prompt.as_deref(),
+                        &{
+                            let mut n = todos.len() + 1;
+                            while todos.iter().any(|t| t.id == format!("lane-{n}")) {
+                                n += 1;
+                            }
+                            format!("lane-{n}")
+                        },
+                    );
+                    if updated != todos {
+                        crate::todo::save_todos(&ctx.session_id, &updated)?;
+                    }
+                    lane_id
+                };
                 let request = Request::CommSpawn {
                     id: REQUEST_ID,
                     session_id: ctx.session_id.clone(),
@@ -2484,10 +2525,18 @@ impl Tool for CommunicateTool {
                     Ok(ServerEvent::CommSpawnResponse { new_session_id, .. })
                         if !new_session_id.is_empty() =>
                     {
-                        Ok(
-                            ToolOutput::new(format!("Spawned new agent: {}", new_session_id))
-                                .with_metadata(serde_json::json!({"session_id": new_session_id})),
-                        )
+                        crate::server::swarm_todo_link::link_assignment(
+                            &ctx.session_id,
+                            &lane_id,
+                            "",
+                            &new_session_id,
+                        );
+                        Ok(ToolOutput::new(format!(
+                            "Spawned new agent: {new_session_id}"
+                        ))
+                        .with_metadata(
+                            serde_json::json!({"session_id": new_session_id, "lane": lane_id}),
+                        ))
                     }
                     Ok(response) => {
                         ensure_success(&response)?;
@@ -2883,11 +2932,13 @@ impl Tool for CommunicateTool {
                 }
             }
 
-            "run_plan" => {
-                // No swarm plan yet: use the coordinator's own todo list as the
-                // plan. Stages run in order and each group in a stage is a lane,
-                // so lanes fan out to workers without the model writing ids.
-                seed_plan_from_todos_if_empty(&ctx).await?;
+            "launch" | "run_plan" => {
+                // The coordinator's todo list is the plan: each lane (a group
+                // within a stage) becomes one item owned by one worker, whose
+                // own todo list is the lane. `launch` re-syncs every time so
+                // the plan never drifts; legacy `run_plan` keeps a hand-written
+                // `propose_plan` by only seeding an empty plan.
+                sync_plan_from_todos(&ctx, params.action == "run_plan").await?;
                 // Background-by-default: the plan driver runs as a managed
                 // background task (progress card, bg tool, notify/wake) so the
                 // coordinating agent stays responsive. Pass background=false
