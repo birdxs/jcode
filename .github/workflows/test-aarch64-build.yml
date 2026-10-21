@@ -21,6 +21,8 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install cross-compilation prerequisites
         shell: bash
@@ -37,7 +39,12 @@ jobs:
           EOF
           apt-get update -qq
           apt-get install -y -qq curl ca-certificates git gcc g++ gcc-aarch64-linux-gnu libssl-dev:arm64 pkg-config
-          git config --global --add safe.directory '*'
+          # ubuntu:22.04 ships git 2.34, which does not support the `*` wildcard
+          # for safe.directory (that landed in 2.36). Name the checkout exactly
+          # so build.rs can embed the git hash/date/changelog.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$(pwd)"
+          git --version
 
       - name: Install nightly Rust with rust-src
         uses: dtolnay/rust-toolchain@nightly
@@ -54,6 +61,15 @@ jobs:
           JCODE_RELEASE_BUILD: "1"
           JCODE_CI_BUILD: "1"
         run: |
+          set -euo pipefail
+          # Embed the same git metadata as the native build. Exporting explicitly
+          # makes a git failure fail the build instead of silently shipping
+          # "(unknown)" for the hash/date/changelog.
+          export JCODE_BUILD_GIT_HASH="$(git rev-parse --short HEAD)"
+          export JCODE_BUILD_GIT_DATE="$(git log -1 --format=%ci)"
+          export JCODE_BUILD_GIT_TAG="$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)"
+          export JCODE_BUILD_CHANGELOG_RAW="$(git log -700 --format='%h|%ct|%D|%s')"
+          echo "Embedding git metadata: ${JCODE_BUILD_GIT_HASH} / ${JCODE_BUILD_GIT_DATE}"
           mkdir -p .cargo
           cat > .cargo/config.toml << 'EOF'
           [target.aarch64-unknown-linux-gnu]

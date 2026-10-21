@@ -375,16 +375,8 @@ jobs:
           ref: ${{ needs.create-release.outputs.tag_sha }}
           fetch-depth: 0
 
-      - name: Apply reviewed release source recovery
-        shell: bash
-        env:
-          WORKFLOW_SHA: ${{ github.sha }}
-          RELEASE_PROVENANCE_PATH: ${{ runner.temp }}/release-provenance.json
-        run: |
-          set -euo pipefail
-          git show "$WORKFLOW_SHA:scripts/apply_release_recovery.py" > "$RUNNER_TEMP/recovery.py"
-          python3 "$RUNNER_TEMP/recovery.py" "$RELEASE_TAG" "$RELEASE_REPAIR" "$WORKFLOW_SHA"
-
+      # Install tooling before the recovery step: it shells out to git and
+      # python3, neither of which ships in the base ubuntu:22.04 image.
       - name: Install cross-compilation prerequisites
         shell: bash
         run: |
@@ -399,8 +391,24 @@ jobs:
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main universe
           EOF
           apt-get update -qq
-          apt-get install -y -qq curl ca-certificates git gcc g++ gcc-aarch64-linux-gnu libssl-dev:arm64 pkg-config
-          git config --global --add safe.directory '*'
+          apt-get install -y -qq curl ca-certificates git python3 gcc g++ gcc-aarch64-linux-gnu libssl-dev:arm64 pkg-config
+          # ubuntu:22.04 ships git 2.34, which does not support the `*` wildcard
+          # for safe.directory (that landed in 2.36). Name the checkout exactly
+          # so build.rs can embed the git hash/date/changelog instead of
+          # falling back to "(unknown)".
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$(pwd)"
+          git --version
+
+      - name: Apply reviewed release source recovery
+        shell: bash
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+          RELEASE_PROVENANCE_PATH: ${{ runner.temp }}/release-provenance.json
+        run: |
+          set -euo pipefail
+          git show "$WORKFLOW_SHA:scripts/apply_release_recovery.py" > "$RUNNER_TEMP/recovery.py"
+          python3 "$RUNNER_TEMP/recovery.py" "$RELEASE_TAG" "$RELEASE_REPAIR" "$WORKFLOW_SHA"
 
       # Nightly + rust-src are required for -Z build-std and -Z tls-model=emulated
       # (Termux/Android support), matching the original ubuntu-24.04-arm build.
@@ -419,6 +427,15 @@ jobs:
           JCODE_CI_BUILD: "1"
           JCODE_BUILD_SEMVER: ${{ env.RELEASE_TAG }}
         run: |
+          set -euo pipefail
+          # Embed the same git metadata as the native build. Exporting explicitly
+          # makes a git failure fail the build instead of silently shipping
+          # "(unknown)" for the hash/date/changelog.
+          export JCODE_BUILD_GIT_HASH="$(git rev-parse --short HEAD)"
+          export JCODE_BUILD_GIT_DATE="$(git log -1 --format=%ci)"
+          export JCODE_BUILD_GIT_TAG="$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)"
+          export JCODE_BUILD_CHANGELOG_RAW="$(git log -700 --format='%h|%ct|%D|%s')"
+          echo "Embedding git metadata: ${JCODE_BUILD_GIT_HASH} / ${JCODE_BUILD_GIT_DATE}"
           mkdir -p .cargo
           cat > .cargo/config.toml << 'EOF'
           [target.aarch64-unknown-linux-gnu]
