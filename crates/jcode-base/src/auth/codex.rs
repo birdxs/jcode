@@ -160,6 +160,8 @@ pub fn has_unconsented_legacy_credentials() -> bool {
 }
 
 pub fn load_auth_file() -> Result<JcodeOpenAiAuthFile> {
+    let _store_lock =
+        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
     let path = jcode_auth_path()?;
     let mut auth = if path.exists() {
         crate::storage::harden_secret_file_permissions(&path);
@@ -180,6 +182,8 @@ pub fn load_auth_file() -> Result<JcodeOpenAiAuthFile> {
 }
 
 pub fn save_auth_file(auth: &JcodeOpenAiAuthFile) -> Result<()> {
+    let _store_lock =
+        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
     let auth_path = jcode_auth_path()?;
     let clean = JcodeOpenAiAuthFile {
         openai_accounts: auth.openai_accounts.clone(),
@@ -233,6 +237,8 @@ pub fn active_account_label() -> Option<String> {
 }
 
 pub fn set_active_account(label: &str) -> Result<()> {
+    let _store_lock =
+        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
     let mut auth = load_auth_file()?;
     crate::auth::account_store::set_active_account(
         label,
@@ -247,6 +253,8 @@ pub fn set_active_account(label: &str) -> Result<()> {
 }
 
 pub fn upsert_account(account: OpenAiAccount) -> Result<String> {
+    let _store_lock =
+        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
     let mut auth = load_auth_file()?;
     let label = crate::auth::account_store::upsert_account(
         ACCOUNT_LABEL_PREFIX,
@@ -261,6 +269,8 @@ pub fn upsert_account(account: OpenAiAccount) -> Result<String> {
 }
 
 pub fn remove_account(label: &str) -> Result<()> {
+    let _store_lock =
+        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
     let mut auth = load_auth_file()?;
     let before = auth.openai_accounts.len();
     auth.openai_accounts
@@ -283,6 +293,8 @@ pub fn remove_account(label: &str) -> Result<()> {
 }
 
 pub fn clear_accounts() -> Result<usize> {
+    let _store_lock =
+        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
     let mut auth = load_auth_file()?;
     let removed = auth.openai_accounts.len();
     auth.openai_accounts.clear();
@@ -300,6 +312,8 @@ pub fn update_account_tokens(
     account_id: Option<String>,
     expires_at: Option<i64>,
 ) -> Result<()> {
+    let _store_lock =
+        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
     let mut auth = load_auth_file()?;
     if let Some(account) = auth
         .openai_accounts
@@ -308,11 +322,20 @@ pub fn update_account_tokens(
     {
         account.access_token = access_token.to_string();
         account.refresh_token = refresh_token.to_string();
-        account.id_token = id_token.clone();
-        account.account_id =
-            account_id.or_else(|| id_token.as_deref().and_then(extract_account_id));
+        // Refresh grants may omit id_token. Keep identity hints from login so
+        // cloud return can still verify the same account after token rotation.
+        if let Some(email) = id_token.as_deref().and_then(extract_email) {
+            account.email = Some(email);
+        }
+        if let Some(identity) =
+            account_id.or_else(|| id_token.as_deref().and_then(extract_account_id))
+        {
+            account.account_id = Some(identity);
+        }
+        if id_token.is_some() {
+            account.id_token = id_token;
+        }
         account.expires_at = expires_at;
-        account.email = id_token.as_deref().and_then(extract_email);
         save_auth_file(&auth)?;
         Ok(())
     } else {
@@ -324,6 +347,8 @@ pub fn update_account_tokens(
 }
 
 pub fn update_account_profile(label: &str, email: Option<String>) -> Result<()> {
+    let _store_lock =
+        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
     let mut auth = load_auth_file()?;
     if let Some(account) = auth
         .openai_accounts
@@ -581,6 +606,18 @@ pub fn extract_email(id_token: &str) -> Option<String> {
         .get("email")
         .and_then(|value| value.as_str())
         .map(|value| value.to_string())
+}
+
+/// Read plan metadata as a routing hint, never as proof of authorization.
+pub fn extract_subscription_type(token: &str) -> Option<String> {
+    let payload = decode_jwt_payload(token)?;
+    payload
+        .get("https://api.openai.com/auth")?
+        .get("chatgpt_plan_type")?
+        .as_str()
+        .map(str::trim)
+        .filter(|plan| !plan.is_empty())
+        .map(str::to_owned)
 }
 
 fn decode_jwt_payload(token: &str) -> Option<Value> {
