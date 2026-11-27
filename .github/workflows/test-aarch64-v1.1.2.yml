@@ -2,6 +2,8 @@ name: Test aarch64 v1.1.2 (mirror of release-aarch64.yml)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [test-aarch64-v1.1.2]
 
 permissions:
   contents: read
